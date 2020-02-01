@@ -27,8 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
-	// "time"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -69,6 +68,14 @@ var (
 		[]string{"target"},
 	)
 
+	totalErrs = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: prometheus.BuildFQName(namespace, "io", "errors"),
+			Help: "Number of ioping process restart",
+		},
+		[]string{"target"},
+	)
+
 	up = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: prometheus.BuildFQName(namespace, "process", "up"),
@@ -102,86 +109,96 @@ type Exporter struct {
 	totalIOs   *prometheus.CounterVec
 	totalBytes *prometheus.CounterVec
 	totalTime  *prometheus.CounterVec
+	totalErrs  *prometheus.CounterVec
 	ioLatency  *prometheus.HistogramVec
 	up         *prometheus.GaugeVec
 	target     string
+	path       string
 	logger     log.Logger
 	cmd        *exec.Cmd
 	stdout     io.ReadCloser
 	ch         chan []float64
+	done       chan error
 }
 
 // NewExporter returns an initialized Exporter.
-func NewExporters(options string, targets map[string]string, totalIOs *prometheus.CounterVec, totalBytes *prometheus.CounterVec, totalTime *prometheus.CounterVec, ioLatency *prometheus.HistogramVec, up *prometheus.GaugeVec, logger log.Logger) ([]*Exporter, error) {
+func NewExporters(options string, targets map[string]string, totalIOs *prometheus.CounterVec, totalBytes *prometheus.CounterVec, totalTime *prometheus.CounterVec, totalErrs *prometheus.CounterVec, ioLatency *prometheus.HistogramVec, up *prometheus.GaugeVec, logger log.Logger) ([]*Exporter, error) {
 
 	exporters := []*Exporter{}
 	for name, target := range targets {
-		// Check for option, binary and target presence
-
-		cmd := exec.Command("ioping", "-q", "-p", "1", target)
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
-			os.Exit(1)
-		}
-
-		level.Info(logger).Log("msg", "Starting ioping process", "cmd", cmd.String())
-		err = cmd.Start()
-		if err != nil {
-			level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
-			os.Exit(1)
-		}
 
 		exporter := &Exporter{
 			totalIOs:   totalIOs,
 			totalBytes: totalBytes,
 			totalTime:  totalTime,
+			totalErrs:  totalErrs,
 			ioLatency:  ioLatency,
 			up:         up,
 			target:     name,
+			path:       target,
 			logger:     logger,
-			cmd:        cmd,
-			stdout:     stdout,
 			ch:         make(chan []float64, 100),
 		}
-
-		go func(e *Exporter) {
-			exporter.cmd.Wait()
-		}(exporter)
-
-		go func(e *Exporter) {
-			level.Debug(e.logger).Log("msg", "Parsing ioping values")
-			se_ch := chan<- []float64(e.ch)
-
-			// Reading all 10 fields, line by line using an internal buffer as a TeeReader
-			// reader := e.printAll()
-			scanner := bufio.NewScanner(e.stdout)
-			scanner.Split(bufio.ScanWords)
-			count := 0
-			ioping_values := make([]float64, 10)
-			for scanner.Scan() {
-				count++
-				ioping_value, err := strconv.ParseFloat(scanner.Text(), 64)
-				if err != nil {
-					level.Error(e.logger).Log("msg", "Error while parsing ioping values", "err", err)
-					continue
-				}
-				level.Debug(e.logger).Log("msg", "Got a new value", "value", ioping_value, "count", count)
-				ioping_values = append(ioping_values, ioping_value)
-				if count == 10 {
-					// Flush values into channel and reset
-					level.Debug(e.logger).Log("msg", "Flushing a set of values")
-					se_ch <- ioping_values
-					count = 0
-					ioping_values = []float64{}
-				}
-			}
-
-		}(exporter)
+		exporter.LaunchTargetProcess(target, logger)
 		exporters = append(exporters, exporter)
 	}
-
 	return exporters, nil
+
+}
+
+func (e *Exporter) LaunchTargetProcess(target string, logger log.Logger) {
+	cmd := exec.Command("ioping", "-q", "-p", "1", target)
+	e.cmd = cmd
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
+		os.Exit(1)
+	}
+	e.stdout = stdout
+
+	level.Info(logger).Log("msg", "Starting ioping process", "cmd", cmd.String())
+
+	done := make(chan error)
+	e.done = done
+
+	err = cmd.Start()
+	go func() { done <- cmd.Wait() }()
+	if err != nil {
+		level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
+		os.Exit(1)
+	}
+
+	go func(e *Exporter) {
+		level.Debug(e.logger).Log("msg", "Parsing ioping values")
+		se_ch := chan<- []float64(e.ch)
+
+		// Reading all 10 fields, line by line using an internal buffer as a TeeReader
+		// reader := e.printAll()
+		scanner := bufio.NewScanner(e.stdout)
+		scanner.Split(bufio.ScanWords)
+		count := 0
+		ioping_values := make([]float64, 10)
+		for scanner.Scan() {
+			count++
+			ioping_value, err := strconv.ParseFloat(scanner.Text(), 64)
+			if err != nil {
+				level.Error(e.logger).Log("msg", "Error while parsing ioping values", "err", err)
+				continue
+			}
+			level.Debug(e.logger).Log("msg", "Got a new value", "value", ioping_value, "count", count)
+			ioping_values = append(ioping_values, ioping_value)
+			if count == 10 {
+				// Flush values into channel and reset
+				level.Debug(e.logger).Log("msg", "Flushing a set of values")
+				se_ch <- ioping_values
+				count = 0
+				ioping_values = []float64{}
+			}
+		}
+		level.Debug(e.logger).Log("msg", "Stdout scanner exited", "target", e.target)
+
+	}(e)
 
 }
 
@@ -213,10 +230,18 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 func (e *Exporter) scrape(ch chan<- prometheus.Metric) (up float64) {
 	// Check state of ioping process
 
-	err := e.cmd.Process.Signal(syscall.Signal(0))
-	if err != nil {
-		level.Error(e.logger).Log("msg", "ioping process is dead, exporter need to be restarted", "target", e.target)
+	select {
+	case err := <-e.done:
+		level.Error(e.logger).Log("msg", "ioping process is dead, restarting process ...", "target", e.target)
+		if err != nil {
+			level.Error(e.logger).Log("msg", "ioping process stopped with the following error", "target", e.target, "err", err)
+			e.totalErrs.WithLabelValues(e.target).Inc()
+		}
+		e.LaunchTargetProcess(e.path, e.logger)
 		return 0
+
+	case <-time.After(200 * time.Millisecond):
+		// timed out
 	}
 
 	level.Debug(e.logger).Log("msg", "Scraping exporter", "target", e.target)
@@ -263,7 +288,7 @@ func main() {
 		[]string{"target"},
 	)
 
-	exporters, err := NewExporters(*ioPingOptions, *ioPingTargets, totalIOs, totalBytes, totalTime, ioLatencyDistribution, up, logger)
+	exporters, err := NewExporters(*ioPingOptions, *ioPingTargets, totalIOs, totalBytes, totalTime, totalErrs, ioLatencyDistribution, up, logger)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
 		os.Exit(1)
@@ -271,6 +296,7 @@ func main() {
 	prometheus.MustRegister(totalIOs)
 	prometheus.MustRegister(totalBytes)
 	prometheus.MustRegister(totalTime)
+	prometheus.MustRegister(totalErrs)
 	prometheus.MustRegister(ioLatencyDistribution)
 	prometheus.MustRegister(up)
 	for _, e := range exporters {
