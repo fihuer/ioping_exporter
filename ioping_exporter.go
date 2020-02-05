@@ -157,7 +157,7 @@ func (e *Exporter) LaunchTargetProcess(target string, logger log.Logger) {
 	}
 	e.stdout = stdout
 
-	level.Info(logger).Log("msg", "Starting ioping process", "cmd", cmd.String())
+	level.Info(logger).Log("msg", "Starting ioping process", "target", target)
 
 	done := make(chan error)
 	e.done = done
